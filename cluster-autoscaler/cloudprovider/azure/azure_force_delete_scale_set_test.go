@@ -52,10 +52,10 @@ func TestShouldForceDelete(t *testing.T) {
 
 func TestIsOperationNotAllowed(t *testing.T) {
 	t.Run("should return false because it's not OperationNotAllowed error", func(t *testing.T) {
-		error := &retry.Error{
+		err := &retry.Error{
 			HTTPStatusCode: http.StatusBadRequest,
 		}
-		assert.Equal(t, isOperationNotAllowed(error), false)
+		assert.Equal(t, isOperationNotAllowed(err.Error()), false)
 	})
 
 	t.Run("should return false because error is nil", func(t *testing.T) {
@@ -63,14 +63,16 @@ func TestIsOperationNotAllowed(t *testing.T) {
 	})
 
 	t.Run("should return true if error is OperationNotAllowed", func(t *testing.T) {
+		// SDK v2: Create an error that contains "OperationNotAllowed" in the message
 		sre := &azure.ServiceError{
 			Code:    retry.OperationNotAllowed,
-			Message: "error-message",
+			Message: "Operation 'ForceDelete' is not allowed on resource 'test' since it manages updates using maintenance control.",
 		}
-		error := &retry.Error{
+		err := &retry.Error{
 			RawError: sre,
 		}
-		assert.Equal(t, isOperationNotAllowed(error), false)
+		// The error message should contain "OperationNotAllowed"
+		assert.Equal(t, isOperationNotAllowed(err.Error()), true)
 	})
 
 	// It is difficult to condition the case where return error matched expected error string for forceDelete and the
