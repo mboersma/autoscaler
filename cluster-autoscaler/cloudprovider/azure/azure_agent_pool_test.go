@@ -18,6 +18,7 @@ package azure
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -25,6 +26,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
+	apiv1 "k8s.io/api/core/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/virtualmachineclient/mock_virtualmachineclient"
 	providerazureconsts "sigs.k8s.io/cloud-provider-azure/pkg/consts"
@@ -184,19 +187,13 @@ func TestAgentPoolGetVMsFromCache(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// NOTE: The tests below are disabled because they test Agent Pool (VMTypeStandard), which is a
-// legacy deployment model. Users should migrate to VMSS (Virtual Machine Scale Sets) instead.
-// The essential Agent Pool functionality is still tested via TestAgentPoolGetVMsFromCache and
-// TestDeleteOutdatedDeployments above. Updating these legacy tests to use SDK v2 mocks is not
-// a priority given that Agent Pools are deprecated.
-/*
 func TestGetVMIndexes(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
 	as := newTestAgentPool(newTestAzureManager(t), "as")
 	expectedVMs := getExpectedVMs()
-	mockVMClient := mockvmclient.NewMockInterface(ctrl)
+	mockVMClient := NewMockInterface(ctrl)
 	as.manager.azClient.virtualMachinesClient = mockVMClient
 	mockVMClient.EXPECT().List(gomock.Any(), as.manager.config.ResourceGroup).Return(expectedVMs, nil)
 	as.manager.config.VMType = providerazureconsts.VMTypeStandard
@@ -236,7 +233,7 @@ func TestGetCurSize(t *testing.T) {
 	as := newTestAgentPool(newTestAzureManager(t), "as")
 	as.curSize = 1
 	expectedVMs := getExpectedVMs()
-	mockVMClient := mockvmclient.NewMockInterface(ctrl)
+	mockVMClient := NewMockInterface(ctrl)
 	as.manager.azClient.virtualMachinesClient = mockVMClient
 	mockVMClient.EXPECT().List(gomock.Any(), as.manager.config.ResourceGroup).Return(expectedVMs, nil)
 	as.manager.config.VMType = providerazureconsts.VMTypeStandard
@@ -260,7 +257,7 @@ func TestAgentPoolTargetSize(t *testing.T) {
 	defer ctrl.Finish()
 
 	as := newTestAgentPool(newTestAzureManager(t), "as")
-	mockVMClient := mockvmclient.NewMockInterface(ctrl)
+	mockVMClient := NewMockInterface(ctrl)
 	as.manager.azClient.virtualMachinesClient = mockVMClient
 	expectedVMs := getExpectedVMs()
 	mockVMClient.EXPECT().List(gomock.Any(), as.manager.config.ResourceGroup).Return(expectedVMs, nil)
@@ -280,7 +277,7 @@ func TestAgentPoolIncreaseSize(t *testing.T) {
 	defer ctrl.Finish()
 
 	as := newTestAgentPool(newTestAzureManager(t), "as")
-	mockVMClient := mockvmclient.NewMockInterface(ctrl)
+	mockVMClient := NewMockInterface(ctrl)
 	as.manager.azClient.virtualMachinesClient = mockVMClient
 	expectedVMs := getExpectedVMs()
 	mockVMClient.EXPECT().List(gomock.Any(), as.manager.config.ResourceGroup).Return(expectedVMs, nil).MaxTimes(2)
@@ -309,7 +306,7 @@ func TestAgentPoolDecreaseTargetSize(t *testing.T) {
 
 	as := newTestAgentPool(newTestAzureManager(t), "as")
 	as.curSize = 3
-	mockVMClient := mockvmclient.NewMockInterface(ctrl)
+	mockVMClient := NewMockInterface(ctrl)
 	as.manager.azClient.virtualMachinesClient = mockVMClient
 	expectedVMs := getExpectedVMs()
 	mockVMClient.EXPECT().List(gomock.Any(), as.manager.config.ResourceGroup).Return(expectedVMs, nil).MaxTimes(3)
@@ -366,10 +363,10 @@ func TestDeleteInstances(t *testing.T) {
 	as.manager.azureCache.instanceToNodeGroup[azureRef{Name: testValidProviderID1}] = as1
 	as.manager.azureCache.instanceToNodeGroup[azureRef{Name: testInvalidProviderID}] = as
 
-	mockVMClient := mockvmclient.NewMockInterface(ctrl)
+	mockVMClient := NewMockInterface(ctrl)
 	as.manager.azClient.virtualMachinesClient = mockVMClient
 
-	mockSAClient := mockstorageaccountclient.NewMockInterface(ctrl)
+	mockSAClient := NewMockStorageAccountClient(ctrl)
 	as.manager.azClient.storageAccountsClient = mockSAClient
 
 	err := as.DeleteInstances([]*azureRef{})
@@ -416,10 +413,10 @@ func TestForceDeleteNodes(t *testing.T) {
 	as.manager.azureCache.instanceToNodeGroup[azureRef{Name: testValidProviderID1}] = as1
 	as.manager.azureCache.instanceToNodeGroup[azureRef{Name: testInvalidProviderID}] = as
 
-	mockVMClient := mockvmclient.NewMockInterface(ctrl)
+	mockVMClient := NewMockInterface(ctrl)
 	as.manager.azClient.virtualMachinesClient = mockVMClient
 
-	mockSAClient := mockstorageaccountclient.NewMockInterface(ctrl)
+	mockSAClient := NewMockStorageAccountClient(ctrl)
 	as.manager.azClient.storageAccountsClient = mockSAClient
 
 	err := as.ForceDeleteNodes([]*apiv1.Node{})
@@ -453,9 +450,9 @@ func TestAgentPoolDeleteNodes(t *testing.T) {
 	as := newTestAgentPool(newTestAzureManager(t), "as")
 	as.manager.azureCache.instanceToNodeGroup[azureRef{Name: testValidProviderID0}] = as
 	expectedVMs := getExpectedVMs()
-	mockVMClient := mockvmclient.NewMockInterface(ctrl)
+	mockVMClient := NewMockInterface(ctrl)
 	as.manager.azClient.virtualMachinesClient = mockVMClient
-	mockSAClient := mockstorageaccountclient.NewMockInterface(ctrl)
+	mockSAClient := NewMockStorageAccountClient(ctrl)
 	as.manager.azClient.storageAccountsClient = mockSAClient
 	mockVMClient.EXPECT().List(gomock.Any(), as.manager.config.ResourceGroup).Return(expectedVMs, nil)
 	as.manager.config.VMType = providerazureconsts.VMTypeStandard
@@ -495,7 +492,7 @@ func TestAgentPoolNodes(t *testing.T) {
 	defer ctrl.Finish()
 
 	as := newTestAgentPool(newTestAzureManager(t), "as")
-	expectedVMs := []compute.VirtualMachine{
+	expectedVMs := []*armcompute.VirtualMachine{
 		{
 			Tags: map[string]*string{"poolName": ptr.To("as")},
 			ID:   ptr.To(""),
@@ -506,7 +503,7 @@ func TestAgentPoolNodes(t *testing.T) {
 		},
 	}
 
-	mockVMClient := mockvmclient.NewMockInterface(ctrl)
+	mockVMClient := NewMockInterface(ctrl)
 	as.manager.azClient.virtualMachinesClient = mockVMClient
 	mockVMClient.EXPECT().List(gomock.Any(), as.manager.config.ResourceGroup).Return(expectedVMs, nil)
 	as.manager.config.VMType = providerazureconsts.VMTypeStandard
@@ -518,7 +515,7 @@ func TestAgentPoolNodes(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(nodes))
 
-	expectedVMs = []compute.VirtualMachine{
+	expectedVMs = []*armcompute.VirtualMachine{
 		{
 			Tags: map[string]*string{"poolName": ptr.To("as")},
 			ID:   ptr.To("foo"),
@@ -532,4 +529,4 @@ func TestAgentPoolNodes(t *testing.T) {
 	assert.Equal(t, expectedErr, err)
 	assert.Nil(t, nodes)
 }
-*/
+
