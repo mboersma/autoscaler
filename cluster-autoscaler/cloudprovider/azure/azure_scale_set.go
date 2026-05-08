@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -245,6 +246,9 @@ func (scaleSet *ScaleSet) getCurSize() (int64, *GetVMSSFailedError) {
 			klog.Errorf("failed to get information for VMSS: %s, error: %v", scaleSet.Name, err)
 			return -1, newGetVMSSFailedError(err, azerrors.IsNotFoundErr(err))
 		}
+		// Persist the freshly-fetched VMSS (including its ETag) so subsequent
+		// capacity updates send an up-to-date If-Match.
+		scaleSet.manager.azureCache.setScaleSet(scaleSet.Name, set)
 	}
 
 	vmssSizeMutex.Lock()
@@ -376,9 +380,10 @@ func (scaleSet *ScaleSet) AtomicIncreaseSize(delta int) error {
 		return err
 	}
 
+	var resp armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse
 	if poller != nil {
 		klog.V(3).Infof("AtomicIncreaseSize: waiting for VMSS %q capacity update to complete", scaleSet.Name)
-		_, err = poller.PollUntilDone(ctx, nil)
+		resp, err = poller.PollUntilDone(ctx, nil)
 		scaleSet.invalidateInstanceCache()
 		if err != nil {
 			klog.Errorf("AtomicIncreaseSize: VMSS %q capacity update failed during polling: %v", scaleSet.Name, err)
@@ -392,6 +397,12 @@ func (scaleSet *ScaleSet) AtomicIncreaseSize(delta int) error {
 	scaleSet.sizeMutex.Lock()
 	vmssSizeMutex.Lock()
 	vmssInfo.SKU.Capacity = &newSize
+	// A successful PUT changes the server-side ETag. Adopt the new one returned by
+	// the operation so a follow-up PUT before the next cache refresh still carries a
+	// valid If-Match rather than overwriting concurrent changes or hitting a 412.
+	if scaleSet.manager.config.EnableVMSSEtag && resp.Etag != nil {
+		vmssInfo.Etag = resp.Etag
+	}
 	vmssSizeMutex.Unlock()
 	scaleSet.curSize = newSize
 	scaleSet.lastSizeRefresh = time.Now()
@@ -513,9 +524,27 @@ func (scaleSet *ScaleSet) initCreateOrUpdate(ctx context.Context, vmssInfo *armc
 	}
 
 	klog.V(3).Infof("Calling virtualMachineScaleSetsClient.BeginCreateOrUpdate(%s)", scaleSet.Name)
-	poller, err := scaleSet.manager.azClient.vmssClientForDelete.BeginCreateOrUpdate(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, op, nil)
+
+	var opts *armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions
+	if scaleSet.manager.config.EnableVMSSEtag {
+		// Read the cached ETag under vmssSizeMutex, the same lock that guards
+		// ETag writes on operation completion, so the read/write pair is
+		// race-free even though initCreateOrUpdate holds only sizeMutex.
+		vmssSizeMutex.Lock()
+		etag := vmssInfo.Etag
+		vmssSizeMutex.Unlock()
+		if etag != nil {
+			opts = &armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions{IfMatch: etag}
+		}
+	}
+	poller, err := scaleSet.manager.azClient.vmssClientForDelete.BeginCreateOrUpdate(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, op, opts)
 	if err != nil {
 		klog.Errorf("virtualMachineScaleSetsClient.BeginCreateOrUpdate for scale set %q failed: %+v", scaleSet.Name, err)
+		if r := azerrors.IsResponseError(err); r != nil && r.StatusCode == http.StatusPreconditionFailed {
+			klog.V(2).Infof("VMSS %s update rejected by ETag precondition; invalidating cache to re-plan next loop", scaleSet.Name)
+			scaleSet.invalidateInstanceCache()
+			scaleSet.manager.invalidateCache()
+		}
 		return nil, err
 	}
 	return poller, nil
@@ -546,18 +575,18 @@ func (scaleSet *ScaleSet) createOrUpdateInstances(vmssInfo *armcompute.VirtualMa
 
 	// Poll for completion asynchronously to avoid blocking the autoscaler
 	if poller != nil {
-		go scaleSet.waitForCreateOrUpdateInstances(poller)
+		go scaleSet.waitForCreateOrUpdateInstances(poller, vmssInfo)
 	}
 	return nil
 }
 
 // waitForCreateOrUpdateInstances waits for the outcome of VMSS capacity update initiated via BeginCreateOrUpdate.
-func (scaleSet *ScaleSet) waitForCreateOrUpdateInstances(poller *runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse]) {
+func (scaleSet *ScaleSet) waitForCreateOrUpdateInstances(poller *runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], vmssInfo *armcompute.VirtualMachineScaleSet) {
 	ctx, cancel := getContextWithTimeout(asyncContextTimeout)
 	defer cancel()
 
 	klog.V(3).Infof("Calling PollUntilDone for CreateOrUpdate(%s)", scaleSet.Name)
-	_, err := poller.PollUntilDone(ctx, nil)
+	resp, err := poller.PollUntilDone(ctx, nil)
 
 	// Invalidate instanceCache on success and failure. Failure might have created a few instances, but it is very rare.
 	scaleSet.invalidateInstanceCache()
@@ -568,6 +597,15 @@ func (scaleSet *ScaleSet) waitForCreateOrUpdateInstances(poller *runtime.Poller[
 		scaleSet.invalidateLastSizeRefreshWithLock()
 		scaleSet.manager.invalidateCache()
 		return
+	}
+
+	// A successful PUT changes the server-side ETag. Adopt the new one returned by
+	// the operation so a follow-up PUT before the next cache refresh still carries a
+	// valid If-Match rather than overwriting concurrent changes or hitting a 412.
+	if scaleSet.manager.config.EnableVMSSEtag && resp.Etag != nil {
+		vmssSizeMutex.Lock()
+		vmssInfo.Etag = resp.Etag
+		vmssSizeMutex.Unlock()
 	}
 
 	klog.V(3).Infof("PollUntilDone for CreateOrUpdate(%s) success", scaleSet.Name)

@@ -2059,3 +2059,349 @@ func TestWaitForDeleteInstancesRetryFailure(t *testing.T) {
 	assert.False(t, scaleSet.lastInstanceRefresh.IsZero(),
 		"expected instance cache to be invalidated after retry failure")
 }
+
+func TestScaleSetIncreaseSizeWithETag(t *testing.T) {
+	const cachedEtag = `W/"abc"`
+	cases := []struct {
+		name            string
+		useEtag         bool
+		cachedEtag      *string
+		beginErr        error
+		expectIfMatch   *string
+		expectErr       bool
+		expectFinalSize int64
+	}{
+		{
+			name:            "flag off: no IfMatch even with cached ETag",
+			useEtag:         false,
+			cachedEtag:      ptr.To(cachedEtag),
+			expectIfMatch:   nil,
+			expectFinalSize: 4,
+		},
+		{
+			name:            "flag on: IfMatch sent from cached ETag",
+			useEtag:         true,
+			cachedEtag:      ptr.To(cachedEtag),
+			expectIfMatch:   ptr.To(cachedEtag),
+			expectFinalSize: 4,
+		},
+		{
+			name:            "flag on but no cached ETag: no IfMatch",
+			useEtag:         true,
+			cachedEtag:      nil,
+			expectIfMatch:   nil,
+			expectFinalSize: 4,
+		},
+		{
+			name:            "flag on, 412 returned: cache invalidated and curSize not bumped",
+			useEtag:         true,
+			cachedEtag:      ptr.To(cachedEtag),
+			beginErr:        &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed},
+			expectIfMatch:   ptr.To(cachedEtag),
+			expectErr:       true,
+			expectFinalSize: 3,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			manager := newTestAzureManager(t)
+			manager.config.EnableVMSSEtag = tc.useEtag
+
+			vmssName := "vmss-etag"
+			orchMode := armcompute.OrchestrationModeUniform
+			vmss := &armcompute.VirtualMachineScaleSet{
+				Name: ptr.To(vmssName),
+				SKU:  &armcompute.SKU{Capacity: ptr.To[int64](3)},
+				Properties: &armcompute.VirtualMachineScaleSetProperties{
+					OrchestrationMode: &orchMode,
+				},
+				Etag: tc.cachedEtag,
+			}
+
+			mockVMSSClient := mock_virtualmachinescalesetclient.NewMockInterface(ctrl)
+			mockVMSSClient.EXPECT().List(gomock.Any(), manager.config.ResourceGroup).
+				Return([]*armcompute.VirtualMachineScaleSet{vmss}, nil).AnyTimes()
+			manager.azClient.virtualMachineScaleSetsClient = mockVMSSClient
+
+			mockVMSSVMClient := mock_virtualmachinescalesetvmclient.NewMockInterface(ctrl)
+			mockVMSSVMClient.EXPECT().ListVMInstanceView(gomock.Any(), manager.config.ResourceGroup, vmssName).
+				Return(newTestVMSSVMList(3), nil).AnyTimes()
+			manager.azClient.virtualMachineScaleSetVMsClient = mockVMSSVMClient
+
+			mockVMClient := mock_virtualmachineclient.NewMockInterface(ctrl)
+			mockVMClient.EXPECT().List(gomock.Any(), manager.config.ResourceGroup).
+				Return([]*armcompute.VirtualMachine{}, nil).AnyTimes()
+			manager.azClient.virtualMachinesClient = mockVMClient
+
+			var capturedOpts *armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions
+			mockDeleteClient := NewMockVMSSDeleteClient(ctrl)
+			mockDeleteClient.EXPECT().
+				BeginCreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				DoAndReturn(func(_ context.Context, _ string, _ string, _ armcompute.VirtualMachineScaleSet,
+					opts *armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions,
+				) (*runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
+					capturedOpts = opts
+					return nil, tc.beginErr
+				}).Times(1)
+			mockDeleteClient.EXPECT().BeginDeleteInstances(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Return(nil, nil).AnyTimes()
+			manager.azClient.vmssClientForDelete = mockDeleteClient
+
+			manager.explicitlyConfigured[vmssName] = true
+			ss := newTestScaleSet(manager, vmssName)
+			assert.True(t, manager.RegisterNodeGroup(ss))
+			assert.NoError(t, manager.Refresh())
+
+			provider, err := BuildAzureCloudProvider(manager, nil)
+			assert.NoError(t, err)
+			scaleSet := provider.NodeGroups()[0].(*ScaleSet)
+
+			err = scaleSet.IncreaseSize(1)
+			if tc.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			if tc.expectIfMatch == nil {
+				assert.True(t, capturedOpts == nil || capturedOpts.IfMatch == nil,
+					"expected no IfMatch but got %v", capturedOpts)
+			} else {
+				if assert.NotNil(t, capturedOpts) && assert.NotNil(t, capturedOpts.IfMatch) {
+					assert.Equal(t, *tc.expectIfMatch, *capturedOpts.IfMatch)
+				}
+			}
+
+			assert.Equal(t, tc.expectFinalSize, scaleSet.curSize)
+		})
+	}
+}
+
+// fakeCreateOrUpdatePollingHandler is a runtime.PollingHandler that completes
+// successfully and returns a CreateOrUpdate response carrying the given ETag.
+type fakeCreateOrUpdatePollingHandler struct {
+	etag   *string
+	polled bool
+}
+
+func (f *fakeCreateOrUpdatePollingHandler) Done() bool { return f.polled }
+
+func (f *fakeCreateOrUpdatePollingHandler) Poll(_ context.Context) (*http.Response, error) {
+	f.polled = true
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
+}
+
+func (f *fakeCreateOrUpdatePollingHandler) Result(_ context.Context, out *armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse) error {
+	out.VirtualMachineScaleSet = armcompute.VirtualMachineScaleSet{Etag: f.etag}
+	return nil
+}
+
+func newTestCreateOrUpdatePoller(t *testing.T, etag *string) *runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse] {
+	resp := &http.Response{StatusCode: http.StatusAccepted, Header: http.Header{}, Body: http.NoBody}
+	pl := runtime.NewPipeline("test", "v0.0.0", runtime.PipelineOptions{}, nil)
+	poller, err := runtime.NewPoller(resp, pl, &runtime.NewPollerOptions[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse]{
+		Handler: &fakeCreateOrUpdatePollingHandler{etag: etag},
+	})
+	assert.NoError(t, err)
+	return poller
+}
+
+func TestWaitForCreateOrUpdateInstancesRefreshesETag(t *testing.T) {
+	const oldEtag = `W/"old"`
+	const newEtag = `W/"new"`
+	cases := []struct {
+		name     string
+		useEtag  bool
+		wantEtag *string
+	}{
+		{name: "flag on: adopts new ETag from completed operation", useEtag: true, wantEtag: ptr.To(newEtag)},
+		{name: "flag off: leaves cached ETag untouched", useEtag: false, wantEtag: ptr.To(oldEtag)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := newTestAzureManager(t)
+			manager.config.EnableVMSSEtag = tc.useEtag
+			ss := newTestScaleSet(manager, "vmss-etag")
+
+			vmssInfo := &armcompute.VirtualMachineScaleSet{
+				Name: ptr.To("vmss-etag"),
+				SKU:  &armcompute.SKU{Capacity: ptr.To[int64](3)},
+				Etag: ptr.To(oldEtag),
+			}
+
+			ss.waitForCreateOrUpdateInstances(newTestCreateOrUpdatePoller(t, ptr.To(newEtag)), vmssInfo)
+
+			if assert.NotNil(t, vmssInfo.Etag) {
+				assert.Equal(t, *tc.wantEtag, *vmssInfo.Etag)
+			}
+		})
+	}
+}
+
+func TestAtomicIncreaseSizeWithETag(t *testing.T) {
+	const cachedEtag = `W/"abc"`
+	const newEtag = `W/"def"`
+	cases := []struct {
+		name            string
+		useEtag         bool
+		beginErr        error
+		expectIfMatch   *string
+		expectErr       bool
+		expectFinalSize int64
+		expectEtag      *string
+	}{
+		{
+			name:            "flag off: no IfMatch, ETag untouched",
+			useEtag:         false,
+			expectIfMatch:   nil,
+			expectFinalSize: 4,
+			expectEtag:      ptr.To(cachedEtag),
+		},
+		{
+			name:            "flag on: IfMatch sent and new ETag adopted on success",
+			useEtag:         true,
+			expectIfMatch:   ptr.To(cachedEtag),
+			expectFinalSize: 4,
+			expectEtag:      ptr.To(newEtag),
+		},
+		{
+			name:            "flag on, 412 returned: cache invalidated and ETag untouched",
+			useEtag:         true,
+			beginErr:        &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed},
+			expectIfMatch:   ptr.To(cachedEtag),
+			expectErr:       true,
+			expectFinalSize: 3,
+			expectEtag:      ptr.To(cachedEtag),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			manager := newTestAzureManager(t)
+			manager.config.EnableVMSSEtag = tc.useEtag
+
+			vmssName := "vmss-etag-atomic"
+			orchMode := armcompute.OrchestrationModeUniform
+			vmss := &armcompute.VirtualMachineScaleSet{
+				Name: ptr.To(vmssName),
+				SKU:  &armcompute.SKU{Capacity: ptr.To[int64](3)},
+				Properties: &armcompute.VirtualMachineScaleSetProperties{
+					OrchestrationMode: &orchMode,
+				},
+				Etag: ptr.To(cachedEtag),
+			}
+
+			mockVMSSClient := mock_virtualmachinescalesetclient.NewMockInterface(ctrl)
+			mockVMSSClient.EXPECT().List(gomock.Any(), manager.config.ResourceGroup).
+				Return([]*armcompute.VirtualMachineScaleSet{vmss}, nil).AnyTimes()
+			manager.azClient.virtualMachineScaleSetsClient = mockVMSSClient
+
+			mockVMSSVMClient := mock_virtualmachinescalesetvmclient.NewMockInterface(ctrl)
+			mockVMSSVMClient.EXPECT().ListVMInstanceView(gomock.Any(), manager.config.ResourceGroup, vmssName).
+				Return(newTestVMSSVMList(3), nil).AnyTimes()
+			manager.azClient.virtualMachineScaleSetVMsClient = mockVMSSVMClient
+
+			mockVMClient := mock_virtualmachineclient.NewMockInterface(ctrl)
+			mockVMClient.EXPECT().List(gomock.Any(), manager.config.ResourceGroup).
+				Return([]*armcompute.VirtualMachine{}, nil).AnyTimes()
+			manager.azClient.virtualMachinesClient = mockVMClient
+
+			var capturedOpts *armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions
+			mockDeleteClient := NewMockVMSSDeleteClient(ctrl)
+			mockDeleteClient.EXPECT().
+				BeginCreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				DoAndReturn(func(_ context.Context, _ string, _ string, _ armcompute.VirtualMachineScaleSet,
+					opts *armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions,
+				) (*runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
+					capturedOpts = opts
+					if tc.beginErr != nil {
+						return nil, tc.beginErr
+					}
+					return newTestCreateOrUpdatePoller(t, ptr.To(newEtag)), nil
+				}).Times(1)
+			manager.azClient.vmssClientForDelete = mockDeleteClient
+
+			manager.explicitlyConfigured[vmssName] = true
+			ss := newTestScaleSet(manager, vmssName)
+			assert.True(t, manager.RegisterNodeGroup(ss))
+			assert.NoError(t, manager.Refresh())
+
+			provider, err := BuildAzureCloudProvider(manager, nil)
+			assert.NoError(t, err)
+			scaleSet := provider.NodeGroups()[0].(*ScaleSet)
+
+			err = scaleSet.AtomicIncreaseSize(1)
+			if tc.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			if tc.expectIfMatch == nil {
+				assert.True(t, capturedOpts == nil || capturedOpts.IfMatch == nil,
+					"expected no IfMatch but got %v", capturedOpts)
+			} else {
+				if assert.NotNil(t, capturedOpts) && assert.NotNil(t, capturedOpts.IfMatch) {
+					assert.Equal(t, *tc.expectIfMatch, *capturedOpts.IfMatch)
+				}
+			}
+
+			assert.Equal(t, tc.expectFinalSize, scaleSet.curSize)
+
+			cached := manager.azureCache.getScaleSets()[vmssName]
+			if assert.NotNil(t, cached) && assert.NotNil(t, cached.Etag) {
+				assert.Equal(t, *tc.expectEtag, *cached.Etag)
+			}
+		})
+	}
+}
+
+// TestETagConcurrentAccessNoDataRace overlaps the ETag reader (initCreateOrUpdate)
+// with the ETag writer (waitForCreateOrUpdateInstances) on the same shared cached
+// VMSS object. It guards against regressing the ETag read back to sizeMutex (the
+// writer uses vmssSizeMutex); run under -race to detect a cross-lock data race.
+func TestETagConcurrentAccessNoDataRace(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	manager := newTestAzureManager(t)
+	manager.config.EnableVMSSEtag = true
+	ss := newTestScaleSet(manager, "vmss-etag-race")
+
+	vmssInfo := &armcompute.VirtualMachineScaleSet{
+		Name:     ptr.To("vmss-etag-race"),
+		Location: ptr.To(testLocation),
+		SKU:      &armcompute.SKU{Name: ptr.To("Standard_D2_v2"), Capacity: ptr.To[int64](3)},
+		Etag:     ptr.To(`W/"r0"`),
+	}
+
+	mockDeleteClient := NewMockVMSSDeleteClient(ctrl)
+	mockDeleteClient.EXPECT().
+		BeginCreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(nil, nil).AnyTimes()
+	manager.azClient.vmssClientForDelete = mockDeleteClient
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := getContextWithTimeout(vmssContextTimeout)
+			defer cancel()
+			_, _ = ss.initCreateOrUpdate(ctx, vmssInfo, 4)
+		}()
+		go func(n int) {
+			defer wg.Done()
+			ss.waitForCreateOrUpdateInstances(newTestCreateOrUpdatePoller(t, ptr.To(fmt.Sprintf(`W/"r%d"`, n))), vmssInfo)
+		}(i)
+	}
+	wg.Wait()
+}

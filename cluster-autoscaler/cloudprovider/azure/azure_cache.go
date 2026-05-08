@@ -165,6 +165,21 @@ func (m *azureCache) getScaleSets() map[string]*armcompute.VirtualMachineScaleSe
 	return m.scaleSets
 }
 
+// setScaleSet replaces the cached entry for a single VMSS, e.g. after a fresh GET.
+// It copies the map before mutating it so readers that obtained the map via
+// getScaleSets() are not exposed to a concurrent map write.
+func (m *azureCache) setScaleSet(name string, vmss *armcompute.VirtualMachineScaleSet) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	scaleSets := make(map[string]*armcompute.VirtualMachineScaleSet, len(m.scaleSets)+1)
+	for k, v := range m.scaleSets {
+		scaleSets[k] = v
+	}
+	scaleSets[name] = vmss
+	m.scaleSets = scaleSets
+}
+
 // Cleanup closes the channel to signal the go routine to stop that is handling the cache
 func (m *azureCache) Cleanup() {
 	close(m.interrupt)
