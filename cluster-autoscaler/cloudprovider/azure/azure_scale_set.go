@@ -493,6 +493,13 @@ func (scaleSet *ScaleSet) Belongs(node *apiv1.Node) (bool, error) {
 	return true, nil
 }
 
+// isPreconditionFailedError reports whether err is an Azure response error with
+// HTTP 412 status, i.e. an ETag If-Match precondition failure.
+func isPreconditionFailedError(err error) bool {
+	r := azerrors.IsResponseError(err)
+	return r != nil && r.StatusCode == http.StatusPreconditionFailed
+}
+
 func (scaleSet *ScaleSet) initCreateOrUpdate(ctx context.Context, vmssInfo *armcompute.VirtualMachineScaleSet, newSize int64) (*runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
 	if vmssInfo == nil {
 		return nil, fmt.Errorf("vmssInfo cannot be nil while increasing scaleSet capacity")
@@ -538,7 +545,7 @@ func (scaleSet *ScaleSet) initCreateOrUpdate(ctx context.Context, vmssInfo *armc
 	poller, err := scaleSet.manager.azClient.vmssClientForDelete.BeginCreateOrUpdate(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, op, opts)
 	if err != nil {
 		klog.Errorf("virtualMachineScaleSetsClient.BeginCreateOrUpdate for scale set %q failed: %+v", scaleSet.Name, err)
-		if r := azerrors.IsResponseError(err); r != nil && r.StatusCode == http.StatusPreconditionFailed {
+		if isPreconditionFailedError(err) {
 			klog.V(2).Infof("VMSS %s update rejected by ETag precondition; invalidating cache to re-plan next loop", scaleSet.Name)
 			scaleSet.invalidateInstanceCache()
 			scaleSet.manager.invalidateCache()
