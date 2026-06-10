@@ -2061,9 +2061,9 @@ func TestWaitForDeleteInstancesRetryFailure(t *testing.T) {
 }
 
 func TestScaleSetIncreaseSizeWithETag(t *testing.T) {
+	t.Parallel()
 	const cachedEtag = `W/"abc"`
-	cases := []struct {
-		name            string
+	cases := map[string]struct {
 		useEtag         bool
 		cachedEtag      *string
 		beginErr        error
@@ -2071,29 +2071,25 @@ func TestScaleSetIncreaseSizeWithETag(t *testing.T) {
 		expectErr       bool
 		expectFinalSize int64
 	}{
-		{
-			name:            "flag off: no IfMatch even with cached ETag",
+		"flag off: no IfMatch even with cached ETag": {
 			useEtag:         false,
 			cachedEtag:      ptr.To(cachedEtag),
 			expectIfMatch:   nil,
 			expectFinalSize: 4,
 		},
-		{
-			name:            "flag on: IfMatch sent from cached ETag",
+		"flag on: IfMatch sent from cached ETag": {
 			useEtag:         true,
 			cachedEtag:      ptr.To(cachedEtag),
 			expectIfMatch:   ptr.To(cachedEtag),
 			expectFinalSize: 4,
 		},
-		{
-			name:            "flag on but no cached ETag: no IfMatch",
+		"flag on but no cached ETag: no IfMatch": {
 			useEtag:         true,
 			cachedEtag:      nil,
 			expectIfMatch:   nil,
 			expectFinalSize: 4,
 		},
-		{
-			name:            "flag on, 412 returned: cache invalidated and curSize not bumped",
+		"flag on, 412 returned: cache invalidated and curSize not bumped": {
 			useEtag:         true,
 			cachedEtag:      ptr.To(cachedEtag),
 			beginErr:        &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed},
@@ -2103,8 +2099,9 @@ func TestScaleSetIncreaseSizeWithETag(t *testing.T) {
 		},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
 
@@ -2181,49 +2178,21 @@ func TestScaleSetIncreaseSizeWithETag(t *testing.T) {
 	}
 }
 
-// fakeCreateOrUpdatePollingHandler is a runtime.PollingHandler that completes
-// successfully and returns a CreateOrUpdate response carrying the given ETag.
-type fakeCreateOrUpdatePollingHandler struct {
-	etag   *string
-	polled bool
-}
-
-func (f *fakeCreateOrUpdatePollingHandler) Done() bool { return f.polled }
-
-func (f *fakeCreateOrUpdatePollingHandler) Poll(_ context.Context) (*http.Response, error) {
-	f.polled = true
-	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
-}
-
-func (f *fakeCreateOrUpdatePollingHandler) Result(_ context.Context, out *armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse) error {
-	out.VirtualMachineScaleSet = armcompute.VirtualMachineScaleSet{Etag: f.etag}
-	return nil
-}
-
-func newTestCreateOrUpdatePoller(t *testing.T, etag *string) *runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse] {
-	resp := &http.Response{StatusCode: http.StatusAccepted, Header: http.Header{}, Body: http.NoBody}
-	pl := runtime.NewPipeline("test", "v0.0.0", runtime.PipelineOptions{}, nil)
-	poller, err := runtime.NewPoller(resp, pl, &runtime.NewPollerOptions[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse]{
-		Handler: &fakeCreateOrUpdatePollingHandler{etag: etag},
-	})
-	assert.NoError(t, err)
-	return poller
-}
-
 func TestWaitForCreateOrUpdateInstancesRefreshesETag(t *testing.T) {
+	t.Parallel()
 	const oldEtag = `W/"old"`
 	const newEtag = `W/"new"`
-	cases := []struct {
-		name     string
+	cases := map[string]struct {
 		useEtag  bool
 		wantEtag *string
 	}{
-		{name: "flag on: adopts new ETag from completed operation", useEtag: true, wantEtag: ptr.To(newEtag)},
-		{name: "flag off: leaves cached ETag untouched", useEtag: false, wantEtag: ptr.To(oldEtag)},
+		"flag on: adopts new ETag from completed operation": {useEtag: true, wantEtag: ptr.To(newEtag)},
+		"flag off: leaves cached ETag untouched":            {useEtag: false, wantEtag: ptr.To(oldEtag)},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			manager := newTestAzureManager(t)
 			manager.config.EnableVMSSEtag = tc.useEtag
 			ss := newTestScaleSet(manager, "vmss-etag")
@@ -2244,10 +2213,10 @@ func TestWaitForCreateOrUpdateInstancesRefreshesETag(t *testing.T) {
 }
 
 func TestAtomicIncreaseSizeWithETag(t *testing.T) {
+	t.Parallel()
 	const cachedEtag = `W/"abc"`
 	const newEtag = `W/"def"`
-	cases := []struct {
-		name            string
+	cases := map[string]struct {
 		useEtag         bool
 		beginErr        error
 		expectIfMatch   *string
@@ -2255,22 +2224,19 @@ func TestAtomicIncreaseSizeWithETag(t *testing.T) {
 		expectFinalSize int64
 		expectEtag      *string
 	}{
-		{
-			name:            "flag off: no IfMatch, ETag untouched",
+		"flag off: no IfMatch, ETag untouched": {
 			useEtag:         false,
 			expectIfMatch:   nil,
 			expectFinalSize: 4,
 			expectEtag:      ptr.To(cachedEtag),
 		},
-		{
-			name:            "flag on: IfMatch sent and new ETag adopted on success",
+		"flag on: IfMatch sent and new ETag adopted on success": {
 			useEtag:         true,
 			expectIfMatch:   ptr.To(cachedEtag),
 			expectFinalSize: 4,
 			expectEtag:      ptr.To(newEtag),
 		},
-		{
-			name:            "flag on, 412 returned: cache invalidated and ETag untouched",
+		"flag on, 412 returned: cache invalidated and ETag untouched": {
 			useEtag:         true,
 			beginErr:        &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed},
 			expectIfMatch:   ptr.To(cachedEtag),
@@ -2280,8 +2246,9 @@ func TestAtomicIncreaseSizeWithETag(t *testing.T) {
 		},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
 

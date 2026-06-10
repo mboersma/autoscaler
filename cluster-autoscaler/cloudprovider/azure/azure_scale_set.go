@@ -398,7 +398,7 @@ func (scaleSet *ScaleSet) AtomicIncreaseSize(delta int) error {
 	vmssSizeMutex.Lock()
 	vmssInfo.SKU.Capacity = &newSize
 	// A successful PUT changes the server-side ETag. Adopt the new one returned by
-	// the operation so a follow-up PUT before the next cache refresh still carries a
+	// the operation so any follow-up PUT before the next cache refresh still carries a
 	// valid If-Match rather than overwriting concurrent changes or hitting a 412.
 	if scaleSet.manager.config.EnableVMSSEtag && resp.Etag != nil {
 		vmssInfo.Etag = resp.Etag
@@ -525,7 +525,7 @@ func (scaleSet *ScaleSet) initCreateOrUpdate(ctx context.Context, vmssInfo *armc
 
 	klog.V(3).Infof("Calling virtualMachineScaleSetsClient.BeginCreateOrUpdate(%s)", scaleSet.Name)
 
-	var opts *armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions
+	opts := &armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions{}
 	if scaleSet.manager.config.EnableVMSSEtag {
 		// Read the cached ETag under vmssSizeMutex, the same lock that guards
 		// ETag writes on operation completion, so the read/write pair is
@@ -533,9 +533,7 @@ func (scaleSet *ScaleSet) initCreateOrUpdate(ctx context.Context, vmssInfo *armc
 		vmssSizeMutex.Lock()
 		etag := vmssInfo.Etag
 		vmssSizeMutex.Unlock()
-		if etag != nil {
-			opts = &armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions{IfMatch: etag}
-		}
+		opts.IfMatch = etag
 	}
 	poller, err := scaleSet.manager.azClient.vmssClientForDelete.BeginCreateOrUpdate(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, op, opts)
 	if err != nil {
@@ -600,7 +598,7 @@ func (scaleSet *ScaleSet) waitForCreateOrUpdateInstances(poller *runtime.Poller[
 	}
 
 	// A successful PUT changes the server-side ETag. Adopt the new one returned by
-	// the operation so a follow-up PUT before the next cache refresh still carries a
+	// the operation so any follow-up PUT before the next cache refresh still carries a
 	// valid If-Match rather than overwriting concurrent changes or hitting a 412.
 	if scaleSet.manager.config.EnableVMSSEtag && resp.Etag != nil {
 		vmssSizeMutex.Lock()

@@ -19,6 +19,7 @@ package azure
 import (
 	"context"
 	"errors"
+	"maps"
 	"reflect"
 	"regexp"
 	"strings"
@@ -172,10 +173,7 @@ func (m *azureCache) setScaleSet(name string, vmss *armcompute.VirtualMachineSca
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	scaleSets := make(map[string]*armcompute.VirtualMachineScaleSet, len(m.scaleSets)+1)
-	for k, v := range m.scaleSets {
-		scaleSets[k] = v
-	}
+	scaleSets := maps.Clone(m.scaleSets)
 	scaleSets[name] = vmss
 	m.scaleSets = scaleSets
 }
