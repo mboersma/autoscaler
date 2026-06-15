@@ -548,6 +548,8 @@ func (scaleSet *ScaleSet) initCreateOrUpdate(ctx context.Context, vmssInfo *armc
 		if isPreconditionFailedError(err) {
 			klog.V(2).Infof("VMSS %s update rejected by ETag precondition; invalidating cache to re-plan next loop", scaleSet.Name)
 			scaleSet.invalidateInstanceCache()
+			// Already holding sizeMutex here, so force the size refresh without re-locking.
+			scaleSet.invalidateLastSizeRefresh()
 			scaleSet.manager.invalidateCache()
 		}
 		return nil, err
@@ -1031,8 +1033,14 @@ func isSpot(vmss *armcompute.VirtualMachineScaleSet) bool {
 
 func (scaleSet *ScaleSet) invalidateLastSizeRefreshWithLock() {
 	scaleSet.sizeMutex.Lock()
-	scaleSet.lastSizeRefresh = time.Now().Add(-1 * scaleSet.sizeRefreshPeriod)
+	scaleSet.invalidateLastSizeRefresh()
 	scaleSet.sizeMutex.Unlock()
+}
+
+// invalidateLastSizeRefresh forces the next getCurSize call to refresh curSize
+// from the VMSS. Callers must already hold sizeMutex.
+func (scaleSet *ScaleSet) invalidateLastSizeRefresh() {
+	scaleSet.lastSizeRefresh = time.Now().Add(-1 * scaleSet.sizeRefreshPeriod)
 }
 
 func (scaleSet *ScaleSet) getOrchestrationMode() (*armcompute.OrchestrationMode, error) {

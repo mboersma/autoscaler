@@ -2178,6 +2178,57 @@ func TestScaleSetIncreaseSizeWithETag(t *testing.T) {
 	}
 }
 
+// TestScaleSetETagPreconditionFailureInvalidatesSizeCache verifies that after a
+// 412 ETag precondition failure the size cache is invalidated, so a subsequent
+// TargetSize call picks up an out-of-band VMSS capacity change rather than
+// returning the stale cached size.
+func TestScaleSetETagPreconditionFailureInvalidatesSizeCache(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	manager := newTestAzureManager(t)
+	manager.config.EnableVMSSEtag = true
+
+	vmssName := "vmss-etag-stale"
+	orchMode := armcompute.OrchestrationModeUniform
+
+	manager.azureCache.setScaleSet(vmssName, &armcompute.VirtualMachineScaleSet{
+		Name: ptr.To(vmssName),
+		SKU:  &armcompute.SKU{Capacity: ptr.To[int64](3)},
+		Properties: &armcompute.VirtualMachineScaleSetProperties{
+			OrchestrationMode: &orchMode,
+		},
+		Etag: ptr.To(`W/"old"`),
+	})
+
+	mockDeleteClient := NewMockVMSSDeleteClient(ctrl)
+	mockDeleteClient.EXPECT().
+		BeginCreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(nil, &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed})
+	manager.azClient.vmssClientForDelete = mockDeleteClient
+
+	scaleSet := newTestScaleSet(manager, vmssName)
+	scaleSet.sizeRefreshPeriod = manager.azureCache.refreshInterval
+
+	err := scaleSet.IncreaseSize(1)
+	assert.Error(t, err)
+
+	// Simulate an out-of-band capacity change observed on the next cache fetch.
+	manager.azureCache.setScaleSet(vmssName, &armcompute.VirtualMachineScaleSet{
+		Name: ptr.To(vmssName),
+		SKU:  &armcompute.SKU{Capacity: ptr.To[int64](5)},
+		Properties: &armcompute.VirtualMachineScaleSetProperties{
+			OrchestrationMode: &orchMode,
+		},
+		Etag: ptr.To(`W/"new"`),
+	})
+
+	target, err := scaleSet.TargetSize()
+	assert.NoError(t, err)
+	assert.Equal(t, 5, target)
+}
+
 func TestWaitForCreateOrUpdateInstancesRefreshesETag(t *testing.T) {
 	t.Parallel()
 	const oldEtag = `W/"old"`
