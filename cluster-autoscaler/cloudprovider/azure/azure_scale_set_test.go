@@ -2066,9 +2066,7 @@ func TestScaleSetIncreaseSizeWithETag(t *testing.T) {
 	cases := map[string]struct {
 		useEtag         bool
 		cachedEtag      *string
-		beginErr        error
 		expectIfMatch   *string
-		expectErr       bool
 		expectFinalSize int64
 	}{
 		"flag off: no IfMatch even with cached ETag": {
@@ -2088,14 +2086,6 @@ func TestScaleSetIncreaseSizeWithETag(t *testing.T) {
 			cachedEtag:      nil,
 			expectIfMatch:   nil,
 			expectFinalSize: 4,
-		},
-		"flag on, 412 returned: cache invalidated and curSize not bumped": {
-			useEtag:         true,
-			cachedEtag:      ptr.To(cachedEtag),
-			beginErr:        &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed},
-			expectIfMatch:   ptr.To(cachedEtag),
-			expectErr:       true,
-			expectFinalSize: 3,
 		},
 	}
 
@@ -2142,7 +2132,7 @@ func TestScaleSetIncreaseSizeWithETag(t *testing.T) {
 					opts *armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions,
 				) (*runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
 					capturedOpts = opts
-					return nil, tc.beginErr
+					return nil, nil
 				}).Times(1)
 			mockDeleteClient.EXPECT().BeginDeleteInstances(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 				Return(nil, nil).AnyTimes()
@@ -2158,11 +2148,7 @@ func TestScaleSetIncreaseSizeWithETag(t *testing.T) {
 			scaleSet := provider.NodeGroups()[0].(*ScaleSet)
 
 			err = scaleSet.IncreaseSize(1)
-			if tc.expectErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
+			assert.NoError(t, err)
 
 			if tc.expectIfMatch == nil {
 				assert.True(t, capturedOpts == nil || capturedOpts.IfMatch == nil,
@@ -2178,10 +2164,10 @@ func TestScaleSetIncreaseSizeWithETag(t *testing.T) {
 	}
 }
 
-// TestScaleSetETagPreconditionFailureInvalidatesSizeCache verifies that after a
-// 412 ETag precondition failure the size cache is invalidated, so a subsequent
-// TargetSize call picks up an out-of-band VMSS capacity change rather than
-// returning the stale cached size.
+// TestScaleSetETagPreconditionFailureInvalidatesSizeCache verifies that when a
+// 412 ETag precondition failure persists across the in-provider refresh-and-retry,
+// the size cache is invalidated, so a subsequent TargetSize call picks up an
+// out-of-band VMSS capacity change rather than returning the stale cached size.
 func TestScaleSetETagPreconditionFailureInvalidatesSizeCache(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
@@ -2202,10 +2188,26 @@ func TestScaleSetETagPreconditionFailureInvalidatesSizeCache(t *testing.T) {
 		Etag: ptr.To(`W/"old"`),
 	})
 
+	// The refresh GET returns a fresh ETag but the capacity is still below target,
+	// so the retried PUT is attempted and rejected with another 412.
+	mockVMSSClient := mock_virtualmachinescalesetclient.NewMockInterface(ctrl)
+	mockVMSSClient.EXPECT().Get(gomock.Any(), manager.config.ResourceGroup, vmssName, gomock.Any()).
+		Return(&armcompute.VirtualMachineScaleSet{
+			Name: ptr.To(vmssName),
+			SKU:  &armcompute.SKU{Capacity: ptr.To[int64](3)},
+			Properties: &armcompute.VirtualMachineScaleSetProperties{
+				OrchestrationMode: &orchMode,
+			},
+			Etag: ptr.To(`W/"refreshed"`),
+		}, nil).AnyTimes()
+	mockVMSSClient.EXPECT().List(gomock.Any(), manager.config.ResourceGroup).
+		Return([]*armcompute.VirtualMachineScaleSet{}, nil).AnyTimes()
+	manager.azClient.virtualMachineScaleSetsClient = mockVMSSClient
+
 	mockDeleteClient := NewMockVMSSDeleteClient(ctrl)
 	mockDeleteClient.EXPECT().
 		BeginCreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(nil, &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed})
+		Return(nil, &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed}).AnyTimes()
 	manager.azClient.vmssClientForDelete = mockDeleteClient
 
 	scaleSet := newTestScaleSet(manager, vmssName)
@@ -2229,10 +2231,10 @@ func TestScaleSetETagPreconditionFailureInvalidatesSizeCache(t *testing.T) {
 	assert.Equal(t, 5, target)
 }
 
-// TestScaleSetETagPreconditionFailureRollsBackCapacity verifies that when a
-// capacity update is rejected (412), the eager capacity mutation on the cached
-// VMSS object is rolled back, so TargetSize reports the prior size rather than
-// the rejected desired size.
+// TestScaleSetETagPreconditionFailureRollsBackCapacity verifies that when a capacity
+// update is rejected (412) and the in-provider retry also fails, the eager capacity
+// mutation on the cached VMSS object is rolled back, so TargetSize reports the prior
+// size rather than the rejected desired size.
 func TestScaleSetETagPreconditionFailureRollsBackCapacity(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
@@ -2253,10 +2255,24 @@ func TestScaleSetETagPreconditionFailureRollsBackCapacity(t *testing.T) {
 		Etag: ptr.To(`W/"old"`),
 	})
 
+	mockVMSSClient := mock_virtualmachinescalesetclient.NewMockInterface(ctrl)
+	mockVMSSClient.EXPECT().Get(gomock.Any(), manager.config.ResourceGroup, vmssName, gomock.Any()).
+		Return(&armcompute.VirtualMachineScaleSet{
+			Name: ptr.To(vmssName),
+			SKU:  &armcompute.SKU{Capacity: ptr.To[int64](3)},
+			Properties: &armcompute.VirtualMachineScaleSetProperties{
+				OrchestrationMode: &orchMode,
+			},
+			Etag: ptr.To(`W/"refreshed"`),
+		}, nil).AnyTimes()
+	mockVMSSClient.EXPECT().List(gomock.Any(), manager.config.ResourceGroup).
+		Return([]*armcompute.VirtualMachineScaleSet{}, nil).AnyTimes()
+	manager.azClient.virtualMachineScaleSetsClient = mockVMSSClient
+
 	mockDeleteClient := NewMockVMSSDeleteClient(ctrl)
 	mockDeleteClient.EXPECT().
 		BeginCreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(nil, &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed})
+		Return(nil, &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed}).AnyTimes()
 	manager.azClient.vmssClientForDelete = mockDeleteClient
 
 	scaleSet := newTestScaleSet(manager, vmssName)
@@ -2270,6 +2286,137 @@ func TestScaleSetETagPreconditionFailureRollsBackCapacity(t *testing.T) {
 	target, err := scaleSet.TargetSize()
 	assert.NoError(t, err)
 	assert.Equal(t, 3, target)
+}
+
+// TestScaleSetETagRetrySucceedsAfterPreconditionFailure verifies that a single 412
+// is transparently recovered: the provider refreshes the ETag via GET and re-issues
+// the capacity update once with the fresh If-Match, so IncreaseSize succeeds without
+// surfacing an error (which would otherwise back off the node group).
+func TestScaleSetETagRetrySucceedsAfterPreconditionFailure(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	manager := newTestAzureManager(t)
+	manager.config.EnableVMSSEtag = true
+
+	vmssName := "vmss-etag-retry"
+	orchMode := armcompute.OrchestrationModeUniform
+	const staleEtag = `W/"stale"`
+	const freshEtag = `W/"fresh"`
+
+	manager.azureCache.setScaleSet(vmssName, &armcompute.VirtualMachineScaleSet{
+		Name: ptr.To(vmssName),
+		SKU:  &armcompute.SKU{Capacity: ptr.To[int64](3)},
+		Properties: &armcompute.VirtualMachineScaleSetProperties{
+			OrchestrationMode: &orchMode,
+		},
+		Etag: ptr.To(staleEtag),
+	})
+
+	mockVMSSClient := mock_virtualmachinescalesetclient.NewMockInterface(ctrl)
+	mockVMSSClient.EXPECT().Get(gomock.Any(), manager.config.ResourceGroup, vmssName, gomock.Any()).
+		Return(&armcompute.VirtualMachineScaleSet{
+			Name: ptr.To(vmssName),
+			SKU:  &armcompute.SKU{Capacity: ptr.To[int64](3)},
+			Properties: &armcompute.VirtualMachineScaleSetProperties{
+				OrchestrationMode: &orchMode,
+			},
+			Etag: ptr.To(freshEtag),
+		}, nil).Times(1)
+	mockVMSSClient.EXPECT().List(gomock.Any(), manager.config.ResourceGroup).
+		Return([]*armcompute.VirtualMachineScaleSet{}, nil).AnyTimes()
+	manager.azClient.virtualMachineScaleSetsClient = mockVMSSClient
+
+	var ifMatches []*string
+	mockDeleteClient := NewMockVMSSDeleteClient(ctrl)
+	mockDeleteClient.EXPECT().
+		BeginCreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ string, _ string, _ armcompute.VirtualMachineScaleSet,
+			opts *armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions,
+		) (*runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
+			ifMatches = append(ifMatches, opts.IfMatch)
+			if len(ifMatches) == 1 {
+				return nil, &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed}
+			}
+			return newTestCreateOrUpdatePoller(t, ptr.To(freshEtag)), nil
+		}).Times(2)
+	manager.azClient.vmssClientForDelete = mockDeleteClient
+
+	scaleSet := newTestScaleSet(manager, vmssName)
+	scaleSet.sizeRefreshPeriod = manager.azureCache.refreshInterval
+
+	err := scaleSet.IncreaseSize(1)
+	assert.NoError(t, err)
+
+	if assert.Len(t, ifMatches, 2) {
+		// First PUT carries the stale cached ETag and is rejected.
+		if assert.NotNil(t, ifMatches[0]) {
+			assert.Equal(t, staleEtag, *ifMatches[0])
+		}
+		// The retried PUT carries the freshly-fetched ETag.
+		if assert.NotNil(t, ifMatches[1]) {
+			assert.Equal(t, freshEtag, *ifMatches[1])
+		}
+	}
+}
+
+// TestScaleSetETagRetrySkippedWhenAlreadyAtTarget verifies that if the refresh GET
+// after a 412 shows the VMSS already at (or above) the desired capacity, the provider
+// treats the scale-up as satisfied and does not issue a second PUT that would shrink it.
+func TestScaleSetETagRetrySkippedWhenAlreadyAtTarget(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	manager := newTestAzureManager(t)
+	manager.config.EnableVMSSEtag = true
+
+	vmssName := "vmss-etag-skip"
+	orchMode := armcompute.OrchestrationModeUniform
+
+	manager.azureCache.setScaleSet(vmssName, &armcompute.VirtualMachineScaleSet{
+		Name: ptr.To(vmssName),
+		SKU:  &armcompute.SKU{Capacity: ptr.To[int64](3)},
+		Properties: &armcompute.VirtualMachineScaleSetProperties{
+			OrchestrationMode: &orchMode,
+		},
+		Etag: ptr.To(`W/"stale"`),
+	})
+
+	// A concurrent writer already grew the VMSS to the desired size (4).
+	mockVMSSClient := mock_virtualmachinescalesetclient.NewMockInterface(ctrl)
+	mockVMSSClient.EXPECT().Get(gomock.Any(), manager.config.ResourceGroup, vmssName, gomock.Any()).
+		Return(&armcompute.VirtualMachineScaleSet{
+			Name: ptr.To(vmssName),
+			SKU:  &armcompute.SKU{Capacity: ptr.To[int64](4)},
+			Properties: &armcompute.VirtualMachineScaleSetProperties{
+				OrchestrationMode: &orchMode,
+			},
+			Etag: ptr.To(`W/"fresh"`),
+		}, nil).Times(1)
+	mockVMSSClient.EXPECT().List(gomock.Any(), manager.config.ResourceGroup).
+		Return([]*armcompute.VirtualMachineScaleSet{}, nil).AnyTimes()
+	manager.azClient.virtualMachineScaleSetsClient = mockVMSSClient
+
+	var putCalls int
+	mockDeleteClient := NewMockVMSSDeleteClient(ctrl)
+	mockDeleteClient.EXPECT().
+		BeginCreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ string, _ string, _ armcompute.VirtualMachineScaleSet,
+			_ *armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions,
+		) (*runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
+			putCalls++
+			return nil, &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed}
+		}).Times(1)
+	manager.azClient.vmssClientForDelete = mockDeleteClient
+
+	scaleSet := newTestScaleSet(manager, vmssName)
+	scaleSet.sizeRefreshPeriod = manager.azureCache.refreshInterval
+
+	err := scaleSet.IncreaseSize(1)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, putCalls, "expected no second PUT when VMSS already at target")
 }
 
 func TestWaitForCreateOrUpdateInstancesRefreshesETag(t *testing.T) {
@@ -2312,9 +2459,7 @@ func TestAtomicIncreaseSizeWithETag(t *testing.T) {
 	const newEtag = `W/"def"`
 	cases := map[string]struct {
 		useEtag         bool
-		beginErr        error
 		expectIfMatch   *string
-		expectErr       bool
 		expectFinalSize int64
 		expectEtag      *string
 	}{
@@ -2329,14 +2474,6 @@ func TestAtomicIncreaseSizeWithETag(t *testing.T) {
 			expectIfMatch:   ptr.To(cachedEtag),
 			expectFinalSize: 4,
 			expectEtag:      ptr.To(newEtag),
-		},
-		"flag on, 412 returned: cache invalidated and ETag untouched": {
-			useEtag:         true,
-			beginErr:        &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed},
-			expectIfMatch:   ptr.To(cachedEtag),
-			expectErr:       true,
-			expectFinalSize: 3,
-			expectEtag:      ptr.To(cachedEtag),
 		},
 	}
 
@@ -2383,9 +2520,6 @@ func TestAtomicIncreaseSizeWithETag(t *testing.T) {
 					opts *armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions,
 				) (*runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
 					capturedOpts = opts
-					if tc.beginErr != nil {
-						return nil, tc.beginErr
-					}
 					return newTestCreateOrUpdatePoller(t, ptr.To(newEtag)), nil
 				}).Times(1)
 			manager.azClient.vmssClientForDelete = mockDeleteClient
@@ -2400,11 +2534,7 @@ func TestAtomicIncreaseSizeWithETag(t *testing.T) {
 			scaleSet := provider.NodeGroups()[0].(*ScaleSet)
 
 			err = scaleSet.AtomicIncreaseSize(1)
-			if tc.expectErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
+			assert.NoError(t, err)
 
 			if tc.expectIfMatch == nil {
 				assert.True(t, capturedOpts == nil || capturedOpts.IfMatch == nil,

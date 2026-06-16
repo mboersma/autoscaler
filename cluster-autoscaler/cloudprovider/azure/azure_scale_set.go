@@ -548,16 +548,58 @@ func (scaleSet *ScaleSet) initCreateOrUpdate(ctx context.Context, vmssInfo *armc
 	poller, err := scaleSet.manager.azClient.vmssClientForDelete.BeginCreateOrUpdate(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, op, opts)
 	if err != nil {
 		klog.Errorf("virtualMachineScaleSetsClient.BeginCreateOrUpdate for scale set %q failed: %+v", scaleSet.Name, err)
-		if isPreconditionFailedError(err) {
-			klog.V(2).Infof("VMSS %s update rejected by ETag precondition; invalidating cache to re-plan next loop", scaleSet.Name)
-			scaleSet.invalidateInstanceCache()
-			// Already holding sizeMutex here, so force the size refresh without re-locking.
-			scaleSet.invalidateLastSizeRefresh()
-			scaleSet.manager.invalidateCache()
+		if scaleSet.manager.config.EnableVMSSEtag && isPreconditionFailedError(err) {
+			// An ETag precondition failure is an optimistic-concurrency conflict, not a
+			// real scale-up failure. Refresh the ETag from a fresh GET and retry once so
+			// a lost race does not surface as an error that would back off the node group.
+			return scaleSet.retryCreateOrUpdateWithFreshETag(ctx, op, newSize)
 		}
 		return nil, err
 	}
 	return poller, nil
+}
+
+// retryCreateOrUpdateWithFreshETag handles an ETag precondition failure by fetching
+// the current VMSS, adopting its ETag, and re-issuing the capacity update once. This
+// keeps a lost optimistic-concurrency race from surfacing as a scale-up failure, which
+// would otherwise back off the node group. Callers must hold sizeMutex.
+func (scaleSet *ScaleSet) retryCreateOrUpdateWithFreshETag(ctx context.Context, op armcompute.VirtualMachineScaleSet, newSize int64) (*runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
+	klog.V(2).Infof("VMSS %s update hit ETag precondition; refreshing ETag and retrying once", scaleSet.Name)
+
+	fresh, err := scaleSet.manager.azClient.virtualMachineScaleSetsClient.Get(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, nil)
+	if err != nil {
+		klog.Errorf("VMSS %s ETag retry: failed to GET current scale set: %v", scaleSet.Name, err)
+		scaleSet.invalidateForPreconditionFailure()
+		return nil, err
+	}
+
+	// Persist the freshly-fetched VMSS (ETag and capacity) for subsequent operations.
+	scaleSet.manager.azureCache.setScaleSet(scaleSet.Name, fresh)
+
+	// If another writer already grew the VMSS to at least our target, the desired floor
+	// is already met; don't issue a PUT that would shrink it back down.
+	if fresh.SKU != nil && fresh.SKU.Capacity != nil && *fresh.SKU.Capacity >= newSize {
+		klog.V(2).Infof("VMSS %s already at capacity %d (>= desired %d) after refresh; skipping retry", scaleSet.Name, *fresh.SKU.Capacity, newSize)
+		return nil, nil
+	}
+
+	opts := &armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions{IfMatch: fresh.Etag}
+	poller, err := scaleSet.manager.azClient.vmssClientForDelete.BeginCreateOrUpdate(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, op, opts)
+	if err != nil {
+		klog.Errorf("VMSS %s ETag retry: BeginCreateOrUpdate failed: %+v", scaleSet.Name, err)
+		scaleSet.invalidateForPreconditionFailure()
+		return nil, err
+	}
+	return poller, nil
+}
+
+// invalidateForPreconditionFailure invalidates the instance, size, and manager caches
+// so the next loop re-plans from fresh Azure state. Callers must hold sizeMutex.
+func (scaleSet *ScaleSet) invalidateForPreconditionFailure() {
+	scaleSet.invalidateInstanceCache()
+	// Already holding sizeMutex here, so force the size refresh without re-locking.
+	scaleSet.invalidateLastSizeRefresh()
+	scaleSet.manager.invalidateCache()
 }
 
 func (scaleSet *ScaleSet) createOrUpdateInstances(vmssInfo *armcompute.VirtualMachineScaleSet, newSize int64) error {
