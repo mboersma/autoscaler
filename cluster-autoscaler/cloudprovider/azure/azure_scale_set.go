@@ -190,6 +190,9 @@ func (scaleSet *ScaleSet) MaxSize() int {
 	return scaleSet.maxSize
 }
 
+// getVMSSFromCache returns the live cached VMSS object.
+// Callers that read or write mutable fields shared with resize paths,
+// especially SKU.Capacity and Etag, must hold vmssSizeMutex.
 func (scaleSet *ScaleSet) getVMSSFromCache() (*armcompute.VirtualMachineScaleSet, error) {
 	allVMSS := scaleSet.manager.azureCache.getScaleSets()
 
@@ -617,10 +620,19 @@ func (scaleSet *ScaleSet) waitForCreateOrUpdateInstances(poller *runtime.Poller[
 	// A successful PUT changes the server-side ETag. Adopt the new one returned by
 	// the operation so any follow-up PUT before the next cache refresh still carries a
 	// valid If-Match rather than overwriting concurrent changes or hitting a 412.
-	if scaleSet.manager.config.EnableVMSSEtag && resp.Etag != nil {
-		vmssSizeMutex.Lock()
-		vmssInfo.Etag = resp.Etag
-		vmssSizeMutex.Unlock()
+	if scaleSet.manager.config.EnableVMSSEtag {
+		if resp.Etag != nil {
+			vmssSizeMutex.Lock()
+			vmssInfo.Etag = resp.Etag
+			vmssSizeMutex.Unlock()
+		} else {
+			// The PUT succeeded but the response carried no ETag, so the cached one
+			// is now stale. Mark the cache for refresh so the next operation fetches
+			// a current ETag via GET instead of sending a stale If-Match (which would
+			// otherwise be rejected with a 412 and force an extra re-plan).
+			scaleSet.invalidateLastSizeRefreshWithLock()
+			scaleSet.manager.invalidateCache()
+		}
 	}
 
 	klog.V(3).Infof("PollUntilDone for CreateOrUpdate(%s) success", scaleSet.Name)
