@@ -2419,6 +2419,100 @@ func TestScaleSetETagRetrySkippedWhenAlreadyAtTarget(t *testing.T) {
 	assert.Equal(t, 1, putCalls, "expected no second PUT when VMSS already at target")
 }
 
+// TestScaleSetETagReconcilesConcurrentWriter exercises the core scenario ETag mode is
+// meant to protect: another writer mutates the VMSS between CA's read and its write.
+// Using a mock that enforces optimistic concurrency like the real API, CA's first PUT
+// carries its stale If-Match and is rejected (412) rather than clobbering the concurrent
+// change; CA then refreshes the ETag via GET and re-issues the PUT once with the
+// up-to-date If-Match, so the scale-up still lands on top of the concurrent change.
+func TestScaleSetETagReconcilesConcurrentWriter(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	manager := newTestAzureManager(t)
+	manager.config.EnableVMSSEtag = true
+
+	vmssName := "vmss-etag-concurrent"
+	orchMode := armcompute.OrchestrationModeUniform
+
+	// CA's cached view: ETag E1, capacity 3.
+	const caCachedEtag = `W/"E1"`
+	manager.azureCache.setScaleSet(vmssName, &armcompute.VirtualMachineScaleSet{
+		Name:       ptr.To(vmssName),
+		SKU:        &armcompute.SKU{Capacity: ptr.To[int64](3)},
+		Properties: &armcompute.VirtualMachineScaleSetProperties{OrchestrationMode: &orchMode},
+		Etag:       ptr.To(caCachedEtag),
+	})
+
+	// Simulated server state: a concurrent writer already advanced the ETag to E2
+	// (e.g. it retagged the VMSS) while leaving capacity at 3.
+	var (
+		mu             sync.Mutex
+		serverEtag     = `W/"E2"`
+		serverCapacity = int64(3)
+	)
+
+	mockVMSSClient := mock_virtualmachinescalesetclient.NewMockInterface(ctrl)
+	mockVMSSClient.EXPECT().Get(gomock.Any(), manager.config.ResourceGroup, vmssName, gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ string, _ string, _ *armcompute.ExpandTypesForGetVMScaleSets,
+		) (*armcompute.VirtualMachineScaleSet, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return &armcompute.VirtualMachineScaleSet{
+				Name:       ptr.To(vmssName),
+				SKU:        &armcompute.SKU{Capacity: ptr.To(serverCapacity)},
+				Properties: &armcompute.VirtualMachineScaleSetProperties{OrchestrationMode: &orchMode},
+				Etag:       ptr.To(serverEtag),
+			}, nil
+		}).Times(1)
+	mockVMSSClient.EXPECT().List(gomock.Any(), manager.config.ResourceGroup).
+		Return([]*armcompute.VirtualMachineScaleSet{}, nil).AnyTimes()
+	manager.azClient.virtualMachineScaleSetsClient = mockVMSSClient
+
+	var ifMatches []*string
+	mockDeleteClient := NewMockVMSSDeleteClient(ctrl)
+	mockDeleteClient.EXPECT().
+		BeginCreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ string, _ string, op armcompute.VirtualMachineScaleSet,
+			opts *armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions,
+		) (*runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
+			mu.Lock()
+			defer mu.Unlock()
+			ifMatches = append(ifMatches, opts.IfMatch)
+			// Enforce optimistic concurrency like the real API: reject a stale If-Match.
+			if opts.IfMatch != nil && *opts.IfMatch != serverEtag {
+				return nil, &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed}
+			}
+			// Accept the write: advance capacity and roll the ETag forward.
+			serverCapacity = *op.SKU.Capacity
+			serverEtag = `W/"E3"`
+			return newTestCreateOrUpdatePoller(t, ptr.To(serverEtag)), nil
+		}).Times(2)
+	manager.azClient.vmssClientForDelete = mockDeleteClient
+
+	scaleSet := newTestScaleSet(manager, vmssName)
+	scaleSet.sizeRefreshPeriod = manager.azureCache.refreshInterval
+
+	err := scaleSet.IncreaseSize(1)
+	assert.NoError(t, err)
+
+	if assert.Len(t, ifMatches, 2) {
+		// First write used CA's stale ETag and was rejected: the concurrent change is not overwritten.
+		if assert.NotNil(t, ifMatches[0]) {
+			assert.Equal(t, caCachedEtag, *ifMatches[0])
+		}
+		// Second write used the refreshed server ETag and was accepted.
+		if assert.NotNil(t, ifMatches[1]) {
+			assert.Equal(t, `W/"E2"`, *ifMatches[1])
+		}
+	}
+
+	mu.Lock()
+	assert.Equal(t, int64(4), serverCapacity, "scale-up should land after reconciling the concurrent writer")
+	mu.Unlock()
+}
+
 func TestWaitForCreateOrUpdateInstancesRefreshesETag(t *testing.T) {
 	t.Parallel()
 	const oldEtag = `W/"old"`
