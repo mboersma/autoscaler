@@ -2229,6 +2229,49 @@ func TestScaleSetETagPreconditionFailureInvalidatesSizeCache(t *testing.T) {
 	assert.Equal(t, 5, target)
 }
 
+// TestScaleSetETagPreconditionFailureRollsBackCapacity verifies that when a
+// capacity update is rejected (412), the eager capacity mutation on the cached
+// VMSS object is rolled back, so TargetSize reports the prior size rather than
+// the rejected desired size.
+func TestScaleSetETagPreconditionFailureRollsBackCapacity(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	manager := newTestAzureManager(t)
+	manager.config.EnableVMSSEtag = true
+
+	vmssName := "vmss-etag-rollback"
+	orchMode := armcompute.OrchestrationModeUniform
+
+	manager.azureCache.setScaleSet(vmssName, &armcompute.VirtualMachineScaleSet{
+		Name: ptr.To(vmssName),
+		SKU:  &armcompute.SKU{Capacity: ptr.To[int64](3)},
+		Properties: &armcompute.VirtualMachineScaleSetProperties{
+			OrchestrationMode: &orchMode,
+		},
+		Etag: ptr.To(`W/"old"`),
+	})
+
+	mockDeleteClient := NewMockVMSSDeleteClient(ctrl)
+	mockDeleteClient.EXPECT().
+		BeginCreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(nil, &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed})
+	manager.azClient.vmssClientForDelete = mockDeleteClient
+
+	scaleSet := newTestScaleSet(manager, vmssName)
+	scaleSet.sizeRefreshPeriod = manager.azureCache.refreshInterval
+
+	err := scaleSet.IncreaseSize(1)
+	assert.Error(t, err)
+
+	// Without the rejected mutation, TargetSize must still report the prior size (3),
+	// not the desired size (4) that was never accepted.
+	target, err := scaleSet.TargetSize()
+	assert.NoError(t, err)
+	assert.Equal(t, 3, target)
+}
+
 func TestWaitForCreateOrUpdateInstancesRefreshesETag(t *testing.T) {
 	t.Parallel()
 	const oldEtag = `W/"old"`

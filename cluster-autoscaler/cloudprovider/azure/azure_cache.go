@@ -207,7 +207,7 @@ func (m *azureCache) regenerate() error {
 
 	// Regenerate VMSS to autoscaling options mapping.
 	newAutoscalingOptions := make(map[azureRef]map[string]string)
-	for _, vmss := range m.scaleSets {
+	for _, vmss := range m.getScaleSets() {
 		ref := azureRef{Name: *vmss.Name}
 		options := extractAutoscalingOptionsFromScaleSetTags(vmss.Tags)
 		if !reflect.DeepEqual(m.getAutoscalingOptions(ref), options) {
@@ -525,6 +525,7 @@ func (m *azureCache) FindForInstance(instance *azureRef, vmType string) (cloudpr
 }
 
 // isAllScaleSetsAreUniform determines if all the scale set autoscaler is monitoring are Uniform or not.
+// Should be called with lock, as it reads m.scaleSets directly.
 func (m *azureCache) areAllScaleSetsUniform() bool {
 	for _, scaleSet := range m.scaleSets {
 		if scaleSet.Properties != nil && scaleSet.Properties.OrchestrationMode != nil &&

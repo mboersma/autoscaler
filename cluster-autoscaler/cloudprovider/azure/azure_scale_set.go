@@ -564,10 +564,18 @@ func (scaleSet *ScaleSet) createOrUpdateInstances(vmssInfo *armcompute.VirtualMa
 	// to avoid overshooting the max size if multiple scale up requests are made concurrently.
 	// This preserves the existing behavior (before atomic scale up was added).
 	vmssSizeMutex.Lock()
+	previousSize := vmssInfo.SKU.Capacity
 	vmssInfo.SKU.Capacity = &newSize
 	vmssSizeMutex.Unlock()
 	poller, err := scaleSet.initCreateOrUpdate(ctx, vmssInfo, newSize)
 	if err != nil {
+		// The update was not accepted (e.g. an ETag precondition failure), so roll
+		// back the eager capacity mutation. Otherwise the rejected desired size would
+		// remain on the cached VMSS object and become visible via getCurSize before
+		// the next full cache refresh.
+		vmssSizeMutex.Lock()
+		vmssInfo.SKU.Capacity = previousSize
+		vmssSizeMutex.Unlock()
 		return err
 	}
 
