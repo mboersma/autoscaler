@@ -115,7 +115,7 @@ type Config struct {
 
 	// EnableVMSSEtag sends the cached VMSS ETag as If-Match on capacity-changing
 	// VMSS PUTs so concurrent modifications are rejected with 412 instead of overwritten.
-	// Enabled by default; set to false to opt out.
+	// Disabled by default; set to true to opt in.
 	EnableVMSSEtag bool `json:"enableVMSSEtag,omitempty" yaml:"enableVMSSEtag,omitempty"`
 }
 
@@ -148,7 +148,7 @@ func BuildAzureConfig(configReader io.Reader) (*Config, error) {
 	cfg.MaxDeploymentsCount = int64(defaultMaxDeploymentsCount)
 	cfg.StrictCacheUpdates = false
 	cfg.EnableLabelPredictionsOnTemplate = true
-	cfg.EnableVMSSEtag = true
+	cfg.EnableVMSSEtag = false
 
 	// Config file overrides defaults
 	if configReader != nil {
