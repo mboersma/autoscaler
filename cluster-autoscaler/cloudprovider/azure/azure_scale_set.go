@@ -377,16 +377,18 @@ func (scaleSet *ScaleSet) AtomicIncreaseSize(delta int) error {
 	ctx, cancel := getContextWithTimeout(asyncContextTimeout)
 	defer cancel()
 
-	poller, err := scaleSet.initCreateOrUpdate(ctx, vmssInfo, newSize)
+	result, err := scaleSet.initCreateOrUpdate(ctx, vmssInfo, newSize)
 	if err != nil {
 		klog.Errorf("AtomicIncreaseSize: BeginCreateOrUpdate for scale set %q failed: %v", scaleSet.Name, err)
 		return err
 	}
+	vmssInfo = result.vmssInfo
+	newSize = result.effectiveSize
 
 	var resp armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse
-	if poller != nil {
+	if result.poller != nil {
 		klog.V(3).Infof("AtomicIncreaseSize: waiting for VMSS %q capacity update to complete", scaleSet.Name)
-		resp, err = poller.PollUntilDone(ctx, nil)
+		resp, err = result.poller.PollUntilDone(ctx, nil)
 		scaleSet.invalidateInstanceCache()
 		if err != nil {
 			klog.Errorf("AtomicIncreaseSize: VMSS %q capacity update failed during polling: %v", scaleSet.Name, err)
@@ -503,7 +505,13 @@ func isPreconditionFailedError(err error) bool {
 	return r != nil && r.StatusCode == http.StatusPreconditionFailed
 }
 
-func (scaleSet *ScaleSet) initCreateOrUpdate(ctx context.Context, vmssInfo *armcompute.VirtualMachineScaleSet, newSize int64) (*runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
+type createOrUpdateResult struct {
+	poller        *runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse]
+	vmssInfo      *armcompute.VirtualMachineScaleSet
+	effectiveSize int64
+}
+
+func (scaleSet *ScaleSet) initCreateOrUpdate(ctx context.Context, vmssInfo *armcompute.VirtualMachineScaleSet, newSize int64) (*createOrUpdateResult, error) {
 	if vmssInfo == nil {
 		return nil, fmt.Errorf("vmssInfo cannot be nil while increasing scaleSet capacity")
 	}
@@ -556,14 +564,14 @@ func (scaleSet *ScaleSet) initCreateOrUpdate(ctx context.Context, vmssInfo *armc
 		}
 		return nil, err
 	}
-	return poller, nil
+	return &createOrUpdateResult{poller: poller, vmssInfo: vmssInfo, effectiveSize: newSize}, nil
 }
 
 // retryCreateOrUpdateWithFreshETag handles an ETag precondition failure by fetching
 // the current VMSS, adopting its ETag, and re-issuing the capacity update once. This
 // keeps a lost optimistic-concurrency race from surfacing as a scale-up failure, which
 // would otherwise back off the node group. Callers must hold sizeMutex.
-func (scaleSet *ScaleSet) retryCreateOrUpdateWithFreshETag(ctx context.Context, op armcompute.VirtualMachineScaleSet, newSize int64) (*runtime.Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
+func (scaleSet *ScaleSet) retryCreateOrUpdateWithFreshETag(ctx context.Context, op armcompute.VirtualMachineScaleSet, newSize int64) (*createOrUpdateResult, error) {
 	klog.V(2).Infof("VMSS %s update hit ETag precondition; refreshing ETag and retrying once", scaleSet.Name)
 
 	fresh, err := scaleSet.manager.azClient.virtualMachineScaleSetsClient.Get(ctx, scaleSet.manager.config.ResourceGroup, scaleSet.Name, nil)
@@ -580,7 +588,7 @@ func (scaleSet *ScaleSet) retryCreateOrUpdateWithFreshETag(ctx context.Context, 
 	// is already met; don't issue a PUT that would shrink it back down.
 	if fresh.SKU != nil && fresh.SKU.Capacity != nil && *fresh.SKU.Capacity >= newSize {
 		klog.V(2).Infof("VMSS %s already at capacity %d (>= desired %d) after refresh; skipping retry", scaleSet.Name, *fresh.SKU.Capacity, newSize)
-		return nil, nil
+		return &createOrUpdateResult{vmssInfo: fresh, effectiveSize: *fresh.SKU.Capacity}, nil
 	}
 
 	opts := &armcompute.VirtualMachineScaleSetsClientBeginCreateOrUpdateOptions{IfMatch: fresh.Etag}
@@ -590,7 +598,7 @@ func (scaleSet *ScaleSet) retryCreateOrUpdateWithFreshETag(ctx context.Context, 
 		scaleSet.invalidateForPreconditionFailure()
 		return nil, err
 	}
-	return poller, nil
+	return &createOrUpdateResult{poller: poller, vmssInfo: fresh, effectiveSize: newSize}, nil
 }
 
 // invalidateForPreconditionFailure invalidates the instance, size, and manager caches
@@ -612,7 +620,7 @@ func (scaleSet *ScaleSet) createOrUpdateInstances(vmssInfo *armcompute.VirtualMa
 	previousSize := vmssInfo.SKU.Capacity
 	vmssInfo.SKU.Capacity = &newSize
 	vmssSizeMutex.Unlock()
-	poller, err := scaleSet.initCreateOrUpdate(ctx, vmssInfo, newSize)
+	result, err := scaleSet.initCreateOrUpdate(ctx, vmssInfo, newSize)
 	if err != nil {
 		// The update was not accepted (e.g. an ETag precondition failure), so roll
 		// back the eager capacity mutation. Otherwise the rejected desired size would
@@ -623,6 +631,11 @@ func (scaleSet *ScaleSet) createOrUpdateInstances(vmssInfo *armcompute.VirtualMa
 		vmssSizeMutex.Unlock()
 		return err
 	}
+	vmssInfo = result.vmssInfo
+	newSize = result.effectiveSize
+	vmssSizeMutex.Lock()
+	vmssInfo.SKU.Capacity = &newSize
+	vmssSizeMutex.Unlock()
 
 	// Proactively set the VMSS size so autoscaler makes better decisions.
 	// initCreateOrUpdate releases sizeMutex before returning, so reacquire it
@@ -634,8 +647,8 @@ func (scaleSet *ScaleSet) createOrUpdateInstances(vmssInfo *armcompute.VirtualMa
 	scaleSet.sizeMutex.Unlock()
 
 	// Poll for completion asynchronously to avoid blocking the autoscaler
-	if poller != nil {
-		go scaleSet.waitForCreateOrUpdateInstances(poller, vmssInfo)
+	if result.poller != nil {
+		go scaleSet.waitForCreateOrUpdateInstances(result.poller, vmssInfo)
 	}
 	return nil
 }
